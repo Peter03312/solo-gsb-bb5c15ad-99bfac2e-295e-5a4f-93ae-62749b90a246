@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 本地 SQLite
+data/
+*.db
+
+# 系统/编辑器
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,13 @@
+services:
+  openapi-review:
+    build: .
+    image: openapi-compat-review:latest
+    container_name: openapi-compat-review
+    ports:
+      - "8000:8000"
+    volumes:
+      - review-data:/data
+    restart: unless-stopped
+
+volumes:
+  review-data:

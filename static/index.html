@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenAPI 版本兼容性审查</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔎</text></svg>" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🔎</span>
+      <div>
+        <h1>OpenAPI 版本兼容性审查</h1>
+        <p class="subtitle">递归解析 $ref（含循环引用），按请求 / 响应语义规则定位破坏性变更</p>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="review">审查</button>
+      <button class="tab" data-tab="history">历史记录</button>
+      <button class="tab" data-tab="rules">规则说明</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ===================== 审查面板 ===================== -->
+    <section id="tab-review" class="tab-panel active">
+      <div class="input-grid">
+        <div class="spec-pane old-pane">
+          <div class="pane-head">
+            <span class="dot old"></span>
+            <h2>旧版 OpenAPI（基线）</h2>
+            <label class="file-btn">
+              上传
+              <input type="file" data-side="old" accept=".json,.yaml,.yml,application/json,text/yaml" hidden />
+            </label>
+            <span class="file-name" id="old-filename"></span>
+          </div>
+          <textarea id="old-spec" spellcheck="false"
+            placeholder='粘贴旧版 OpenAPI JSON 或 YAML，例如：&#10;{&#10;  "openapi": "3.0.3",&#10;  "info": { "title": "Petstore", "version": "1.0.0" },&#10;  "paths": { ... }&#10;}'></textarea>
+        </div>
+
+        <div class="spec-pane new-pane">
+          <div class="pane-head">
+            <span class="dot new"></span>
+            <h2>新版 OpenAPI（候选）</h2>
+            <label class="file-btn">
+              上传
+              <input type="file" data-side="new" accept=".json,.yaml,.yml,application/json,text/yaml" hidden />
+            </label>
+            <span class="file-name" id="new-filename"></span>
+          </div>
+          <textarea id="new-spec" spellcheck="false"
+            placeholder="粘贴新版 OpenAPI JSON 或 YAML…"></textarea>
+        </div>
+      </div>
+
+      <div class="action-bar">
+        <div class="samples">
+          示例：
+          <button class="link-btn" data-sample="breaking">典型破坏性变更</button>
+          <button class="link-btn" data-sample="cyclic">循环 $ref</button>
+          <button class="link-btn" data-sample="compatible">纯兼容新增</button>
+          <button class="link-btn" data-sample="enum">枚举/约束收窄</button>
+          <button class="link-btn" data-sample="auth">认证要求收紧</button>
+        </div>
+        <div class="actions-right">
+          <input type="text" id="api-id-input" class="api-id-input"
+            placeholder="API 标识（可选，用于豁免）"
+            title="用于限时豁免匹配；留空则该审查不应用任何豁免" />
+          <button id="clear-btn" class="ghost-btn">清空</button>
+          <button id="compare-btn" class="primary-btn">开始审查 →</button>
+        </div>
+      </div>
+
+      <div id="error-banner" class="banner error hidden"></div>
+      <div id="loading" class="loading hidden"><span class="spinner"></span> 正在解析与比对…</div>
+
+      <div id="result-area" class="hidden">
+        <div class="result-header">
+          <div>
+            <h2 id="result-title">审查结果</h2>
+            <p id="result-meta" class="result-meta"></p>
+          </div>
+          <div class="verdict" id="verdict"></div>
+          <div class="report-actions">
+            <button id="download-md" class="ghost-btn">⬇ 下载 Markdown 报告</button>
+            <button id="download-json" class="ghost-btn">⬇ 下载 JSON 报告</button>
+          </div>
+        </div>
+
+        <div class="stat-cards" id="stat-cards"></div>
+
+        <div id="exemption-bar" class="exemption-bar hidden"></div>
+
+        <!-- 组件可达性审计 -->
+        <section id="reachability-panel" class="reachability-panel hidden">
+          <div class="reach-head">
+            <h3>🧭 组件可达性审计</h3>
+            <span id="reach-summary" class="reach-summary"></span>
+          </div>
+          <p class="result-meta">
+            从 paths / webhooks 实际入口出发，沿本地 $ref 传递追踪 components（循环引用只访问一次）；
+            全局与操作级 security 按名称引用的 securitySchemes 也算可达。点击组件条目可定位到对应版本的引用树。
+          </p>
+          <div id="reach-body" class="reach-columns"></div>
+        </section>
+
+        <!-- 调用清单影响定位 -->
+        <section id="impact-panel" class="impact-panel hidden">
+          <div class="impact-head">
+            <h3>📊 调用清单影响定位</h3>
+            <div class="impact-controls">
+              <label class="file-btn">
+                选择 CSV
+                <input type="file" id="impact-file" accept=".csv,text/csv" hidden />
+              </label>
+              <span id="impact-filename" class="file-name"></span>
+              <button id="impact-run" class="primary-btn">导入并定位</button>
+            </div>
+          </div>
+          <p class="result-meta">
+            CSV 首行须为 <code>method,path,count</code>；后端按<b>旧版 paths</b> 的 HTTP 方法与路径模板匹配每行调用，
+            <b>静态段优先于参数段</b>；若最优候选仍不唯一则标为歧义且不分配调用量，唯一匹配的调用量按操作汇总并关联该操作的破坏性发现。
+            查询串（<code>?... </code>）不参与匹配，<code>count</code> 须为正整数，重复行调用量累加；
+            <b>导入结果只供本次查看，不改变审查结论</b>。
+          </p>
+          <details class="impact-paste">
+            <summary>没有文件？直接粘贴 CSV 文本</summary>
+            <textarea id="impact-text" class="impact-textarea" spellcheck="false"
+              placeholder="method,path,count&#10;GET,/pets/123,1200&#10;POST,/pets,80"></textarea>
+          </details>
+          <div id="impact-banner" class="banner error hidden"></div>
+          <div id="impact-loading" class="loading hidden"><span class="spinner"></span> 正在匹配调用清单…</div>
+          <div id="impact-body"></div>
+        </section>
+
+        <!-- 请求样本回放 -->
+        <section id="sample-panel" class="impact-panel sample-panel hidden">
+          <div class="impact-head">
+            <h3>🧪 请求样本回放（旧版接受 → 新版拒绝？）</h3>
+            <div class="impact-controls">
+              <label class="file-btn">
+                选择 JSON
+                <input type="file" id="sample-file" accept=".json,application/json" hidden />
+              </label>
+              <span id="sample-filename" class="file-name"></span>
+              <button id="sample-run" class="primary-btn">提交并逐条校验</button>
+            </div>
+          </div>
+          <p class="result-meta">
+            提交多条请求样本，每条包含旧版操作的<b>方法</b>与<b>路径模板</b>、<b>Content-Type</b> 和 <b>JSON 请求体</b>；
+            后端按<b>相同方法与路径模板</b>在新版查找操作（操作或媒体类型消失视为新版拒绝），
+            对两侧请求体分别做 schema 校验（覆盖 <code>type</code> / <code>required</code> / <code>enum</code> /
+            <code>properties</code> / <code>items</code> / <code>allOf</code> / 本地 <code>$ref</code>，循环引用安全终止）。
+            <b>无法解析的引用或范围外约束标为无法判定、不计风险；旧版拒绝的样本也不计风险。</b>
+            结果只供本次查看，不改变原审查结论。
+          </p>
+          <details class="impact-paste" open>
+            <summary>样本 JSON（数组；也可直接粘贴后点「提交并逐条校验」）</summary>
+            <textarea id="sample-text" class="impact-textarea" spellcheck="false"
+              placeholder='[&#10;  {&#10;    "method": "POST",&#10;    "path": "/pets",&#10;    "content_type": "application/json",&#10;    "body": { "name": "Rex", "kind": "cat" }&#10;  }&#10;]'></textarea>
+          </details>
+          <div id="sample-banner" class="banner error hidden"></div>
+          <div id="sample-loading" class="loading hidden"><span class="spinner"></span> 正在逐条校验请求样本…</div>
+          <div id="sample-body"></div>
+        </section>
+
+        <div class="filters">
+          <div class="filter-group" id="severity-filters">
+            <button class="chip active" data-severity="all">全部 <span class="count" data-count="all">0</span></button>
+            <button class="chip sev-breaking" data-severity="breaking">🔴 破坏性 <span class="count" data-count="breaking">0</span></button>
+            <button class="chip sev-non_breaking" data-severity="non_breaking">🟢 兼容 <span class="count" data-count="non_breaking">0</span></button>
+            <button class="chip sev-deprecation" data-severity="deprecation">🟡 废弃 <span class="count" data-count="deprecation">0</span></button>
+            <button class="chip sev-info" data-severity="info">⚪ 信息 <span class="count" data-count="info">0</span></button>
+          </div>
+          <div class="filter-group filter-right">
+            <select id="direction-filter">
+              <option value="all">全部方向</option>
+              <option value="request">请求方向</option>
+              <option value="response">响应方向</option>
+              <option value="none">结构性（非载荷）</option>
+            </select>
+            <select id="category-filter">
+              <option value="all">全部分类</option>
+            </select>
+            <input type="search" id="text-filter" placeholder="筛选端点 / 字段 / 原因…" />
+          </div>
+        </div>
+
+        <div class="view-bar">
+          <div class="view-toggle" id="view-toggle">
+            <button class="toggle-btn active" data-view="flat">逐条发现</button>
+            <button class="toggle-btn" data-view="groups">根因聚合</button>
+          </div>
+          <span id="view-meta" class="view-meta"></span>
+        </div>
+
+        <div class="content-columns">
+          <div class="findings-col">
+            <div id="findings-list"></div>
+            <div id="findings-empty" class="empty-hint hidden">没有符合筛选条件的变更。</div>
+          </div>
+
+          <aside class="tree-col">
+            <div class="tree-head">
+              <h3>引用展开树</h3>
+              <div class="tree-controls">
+                <select id="tree-side">
+                  <option value="new">新版</option>
+                  <option value="old">旧版</option>
+                </select>
+                <select id="tree-pointer"><option value="">（根文档）</option></select>
+                <button id="tree-expand" class="mini-btn" title="全部展开">⊕</button>
+                <button id="tree-collapse" class="mini-btn" title="全部折叠">⊖</button>
+              </div>
+            </div>
+            <p class="tree-hint">点击发现项右侧的 🌲 可直接定位到对应 $ref；循环引用以 ⟳ 标记。</p>
+            <div id="tree-container" class="tree-container"></div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== 历史面板 ===================== -->
+    <section id="tab-history" class="tab-panel">
+      <h2>历史审查</h2>
+      <p class="result-meta">最近 100 条记录，保存在服务器端 SQLite 中。</p>
+
+      <!-- 破坏项对账 -->
+      <div class="reconcile-panel">
+        <div class="reconcile-head">
+          <h3>⚖️ 破坏项对账</h3>
+          <p class="result-meta">
+            选一条已保存审查作基线，与当前打开的审查比较：后端按「端点 + 方向 + 规则 + 语义定位」构造稳定身份
+            （忽略发现 ID 与顺序），同身份重复发现按出现次数一一配对，输出新增 / 延续 / 已消失三类破坏项。
+          </p>
+        </div>
+        <div class="reconcile-controls">
+          <span class="reconcile-current">当前审查：<b id="reconcile-current">（尚未打开审查）</b></span>
+          <select id="reconcile-baseline"><option value="">选择基线审查…</option></select>
+          <button id="reconcile-run" class="primary-btn">开始对账</button>
+        </div>
+        <div id="reconcile-banner" class="banner error hidden"></div>
+        <div id="reconcile-result"></div>
+      </div>
+
+      <table class="history-table">
+        <thead>
+          <tr><th>#</th><th>时间</th><th>标题</th><th>版本变化</th><th>破坏性</th><th>总数</th><th></th></tr>
+        </thead>
+        <tbody id="history-body"></tbody>
+      </table>
+      <div id="history-empty" class="empty-hint">暂无历史记录。</div>
+    </section>
+
+    <!-- ===================== 规则说明面板 ===================== -->
+    <section id="tab-rules" class="tab-panel">
+      <h2>语义兼容性规则</h2>
+      <p class="result-meta">
+        判定按两个方向独立进行：<b>请求方向</b>关注"客户端原本合法发送的内容是否被收紧"；
+        <b>响应方向</b>关注"客户端原本可能收到的承诺是否被改变"。因此同一类 schema 变化在两个方向上结论可能相反。
+      </p>
+      <div id="rules-content" class="rules-grid"></div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    FastAPI · SQLite · 原生 JavaScript · OpenAPI 3.x（JSON / YAML）
+  </footer>
+
+  <script src="/samples.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

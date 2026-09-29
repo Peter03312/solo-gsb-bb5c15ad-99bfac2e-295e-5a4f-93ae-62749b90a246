@@ -1,6 +1,7 @@
-"""FastAPI 入口：审查、历史、引用展开树、根因聚合、破坏项对账、组件可达性审计、调用清单影响定位、请求样本回放、限时豁免、报告下载、最小复现包导出。"""
+"""FastAPI 入口：审查、历史、引用展开树、根因聚合、破坏项对账、组件可达性审计、调用清单影响定位、请求样本回放、Link 后续调用参数预览、限时豁免、报告下载、最小复现包导出。"""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import database, exemptions, groups, impact, reachability, reconcile, reports, repro, samplecheck
+from . import database, exemptions, groups, impact, linkpreview, reachability, reconcile, reports, repro, samplecheck
 from .diff import BREAKING, run_diff, summarize
 from .parser import SpecParseError, load_spec
 from .refs import build_ref_tree, expand_path_to_pointer, list_root_pointers
@@ -73,6 +74,24 @@ class SampleCheckRequest(BaseModel):
             "content_type（如 application/json）与 body（JSON 值或 JSON 文本）。"
             "非对象或字段缺失的元素在结果中逐条报错。"
         ),
+    )
+
+
+class LinkPreviewRequest(BaseModel):
+    side: str = Field(..., description="在哪一侧文档预览：old（旧版）或 new（新版）")
+    method: str = Field(..., description="源操作 HTTP 方法，如 GET（大小写不敏感）")
+    path: str = Field(..., description="源操作路径模板，如 /pets/{id}")
+    status_code: int = Field(..., description="提交的响应状态码（100–599 整数）")
+    response_body: Any = Field(
+        default=None,
+        description=(
+            "JSON 响应体（JSON 值；也接受 JSON 文本字符串，后端会再解析一次），"
+            "供 $response.body#JSONPointer 取值。"
+        ),
+    )
+    headers: dict[str, Any] | None = Field(
+        default=None,
+        description="提交的响应头（头名称 → 值）；$response.header.名称 取值时忽略大小写。",
     )
 
 
@@ -361,6 +380,55 @@ def sample_check(review_id: int, req: SampleCheckRequest) -> dict[str, Any]:
             review["old_spec"], review["new_spec"], req.samples
         )
     except samplecheck.SampleCheckError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    result["review_id"] = review_id
+    return result
+
+
+# ---------------------------------------------------------------------- #
+# 响应实例 → Link 后续调用参数预览（仅本次查看）
+# ---------------------------------------------------------------------- #
+@app.post("/api/reviews/{review_id}/link-preview")
+def link_preview(review_id: int, req: LinkPreviewRequest) -> dict[str, Any]:
+    """用一次响应实例预览 OpenAPI Link 的后续调用参数。
+
+    选择旧 / 新版文档与源操作（方法 + 路径模板），提交状态码、JSON 响应体与
+    响应头；响应按精确码 → 范围码（1XX…5XX）→ default 匹配。逐条返回 Link 指针、
+    目标方法 / 路径（唯一 operationId 或本地 operationRef）与每个目标参数的取值
+    （合并路径级 + 操作级参数，操作级覆盖；支持 JSON 常量、
+    $response.body#JSONPointer、$response.header.名称；指针解码 ~0/~1，头名忽略
+    大小写，null 算已提供）。未知参数 / 歧义裸名 / 缺少必填值 / 不支持的表达式 /
+    外部或失效 $ref 逐条报错。实时计算、不入库、不发请求、不改变审查结论。
+    """
+    review = database.get_review(review_id, with_specs=True)
+    if review is None:
+        raise HTTPException(status_code=404, detail="审查记录不存在")
+    if req.side not in ("old", "new"):
+        raise HTTPException(status_code=400, detail="side 必须是 old（旧版）或 new（新版）")
+    doc = review["old_spec"] if req.side == "old" else review["new_spec"]
+
+    # 允许把响应体写成 JSON 文本（与请求样本回放一致）
+    response_body = req.response_body
+    if isinstance(response_body, str):
+        try:
+            response_body = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"响应体 JSON 文本解析失败：{exc.msg}（第 {exc.lineno} 行第 {exc.colno} 列）",
+            )
+
+    try:
+        result = linkpreview.build_link_preview(
+            doc,
+            side=req.side,
+            method=req.method,
+            path=req.path,
+            status_code=req.status_code,
+            response_body=response_body,
+            headers=req.headers,
+        )
+    except linkpreview.LinkPreviewError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     result["review_id"] = review_id
     return result

@@ -167,6 +167,54 @@
           <div id="sample-body"></div>
         </section>
 
+        <!-- Link 后续调用参数预览 -->
+        <section id="link-panel" class="impact-panel link-panel hidden">
+          <div class="impact-head">
+            <h3>🔗 Link 后续调用参数预览（响应实例 → 下一跳）</h3>
+            <div class="impact-controls">
+              <button id="link-run" class="primary-btn">预览 Link 参数</button>
+            </div>
+          </div>
+          <p class="result-meta">
+            选择<b>旧 / 新版</b>与源操作（HTTP 方法 + 路径模板），提交一次响应实例（<b>状态码</b>、<b>JSON 响应体</b>、<b>响应头</b>）；
+            响应按<b>精确码 → 范围码（1XX…5XX）→ default</b> 匹配，逐条 Link 显示指针、目标方法 / 路径
+            （唯一 <code>operationId</code> 或本地 <code>operationRef</code>）与每个参数的取值（路径级 + 操作级合并，操作级覆盖）。
+            值支持 JSON 常量、<code>$response.body#/JSONPointer</code>（解码 <code>~0</code>/<code>~1</code>）、
+            <code>$response.header.名称</code>（头名忽略大小写）；<code>null</code> 算已提供，其余表达式报不支持；
+            外部引用 / 歧义 / 未知参数 / 缺少必填值逐条报错。<b>只预览、不发请求、不入库、不改变审查结论。</b>
+          </p>
+          <div class="link-form">
+            <select id="link-side">
+              <option value="old">旧版</option>
+              <option value="new">新版</option>
+            </select>
+            <select id="link-method">
+              <option>GET</option><option>POST</option><option>PUT</option>
+              <option>PATCH</option><option>DELETE</option><option>HEAD</option>
+              <option>OPTIONS</option><option>TRACE</option>
+            </select>
+            <input type="text" id="link-path" list="link-path-list" placeholder="源路径模板，如 /pets/{id}" />
+            <datalist id="link-path-list"></datalist>
+            <input type="number" id="link-status" min="100" max="599" step="1" value="200"
+              title="响应状态码（100–599）" />
+          </div>
+          <div class="link-textareas">
+            <div class="link-ta-col">
+              <label for="link-body">JSON 响应体</label>
+              <textarea id="link-body" class="impact-textarea" spellcheck="false"
+                placeholder='{ "id": 42, "owner": { "name": "Ada" } }'></textarea>
+            </div>
+            <div class="link-ta-col">
+              <label for="link-headers">响应头（JSON 对象）</label>
+              <textarea id="link-headers" class="impact-textarea link-headers" spellcheck="false"
+                placeholder='{ "X-Request-Id": "abc-123" }'></textarea>
+            </div>
+          </div>
+          <div id="link-banner" class="banner error hidden"></div>
+          <div id="link-loading" class="loading hidden"><span class="spinner"></span> 正在解析 Link…</div>
+          <div id="link-body-out"></div>
+        </section>
+
         <div class="filters">
           <div class="filter-group" id="severity-filters">
             <button class="chip active" data-severity="all">全部 <span class="count" data-count="all">0</span></button>

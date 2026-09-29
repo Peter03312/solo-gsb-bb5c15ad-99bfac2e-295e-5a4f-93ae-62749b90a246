@@ -19,6 +19,7 @@
     impactRid: null,       // 影响结果所属审查 ID（切换审查即失效）
     sampleCheck: null,     // 最近一次请求样本回放结果（仅本次查看）
     sampleRid: null,       // 回放结果所属审查 ID（切换审查即失效）
+    linkPaths: { old: [], new: [] }, // 两侧路径模板（供 Link 预览 datalist）
   };
 
   const SEV_LABEL = {
@@ -182,6 +183,7 @@
     state.groupsPromise = null;
     resetImpactPanel();
     resetSamplePanel();
+    resetLinkPanel();
     $$("#view-toggle .toggle-btn").forEach((b) =>
       b.classList.toggle("active", b.dataset.view === "flat"));
     $("#view-meta").textContent = "";
@@ -1636,6 +1638,231 @@
     const bits = [r.method, r.path].filter(Boolean).join(" ");
     return `<span class="finding-endpoint">${escapeHtml(bits || "（不完整样本）")}</span>
       ${r.content_type ? `<div class="sc-meta"><code>${escapeHtml(r.content_type)}</code></div>` : ""}`;
+  }
+
+  // ------------------------------------------------------------------ //
+  // Link 后续调用参数预览（响应实例 → 下一跳；不发请求、不入库）
+  // ------------------------------------------------------------------ //
+  function resetLinkPanel() {
+    const panel = $("#link-panel");
+    if (!panel) return;
+    panel.classList.remove("hidden");
+    $("#link-body-out").innerHTML = "";
+    $("#link-banner").classList.add("hidden");
+    $("#link-loading").classList.add("hidden");
+    state.linkPaths = { old: [], new: [] };
+    $("#link-path-list").innerHTML = "";
+    if (state.review && state.review.id) loadLinkPointers(state.review.id);
+  }
+
+  async function loadLinkPointers(rid) {
+    try {
+      const resp = await fetch(`/api/reviews/${rid}/pointers`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      for (const side of ["old", "new"]) {
+        const group = (data[side] || []).find((g) => g.group === "paths");
+        state.linkPaths[side] = group ? group.items.map((it) => it.label) : [];
+      }
+      syncLinkPathList();
+    } catch (_) { /* datalist 仅为辅助，失败静默 */ }
+  }
+
+  function syncLinkPathList() {
+    const side = $("#link-side").value;
+    $("#link-path-list").innerHTML = (state.linkPaths[side] || [])
+      .map((p) => `<option value="${escapeAttr(p)}"></option>`).join("");
+  }
+
+  $("#link-side").addEventListener("change", syncLinkPathList);
+  $("#link-run").addEventListener("click", runLinkPreview);
+
+  function showLinkError(msg) {
+    const el = $("#link-banner");
+    el.textContent = msg;
+    el.classList.remove("hidden");
+  }
+  function hideLinkError() { $("#link-banner").classList.add("hidden"); }
+
+  async function runLinkPreview() {
+    if (!state.review || !state.review.id) return;
+    hideLinkError();
+    const side = $("#link-side").value;
+    const method = $("#link-method").value;
+    const path = $("#link-path").value.trim();
+    const statusRaw = $("#link-status").value.trim();
+    if (!path) { showLinkError("请填写源操作的路径模板（如 /pets/{id}）。"); return; }
+    const statusCode = Number(statusRaw);
+    if (!Number.isInteger(statusCode) || statusCode < 100 || statusCode > 599) {
+      showLinkError("状态码须为 100–599 之间的整数。"); return;
+    }
+    let responseBody = null;
+    const bodyText = $("#link-body").value.trim();
+    if (bodyText) {
+      try {
+        responseBody = JSON.parse(bodyText);
+      } catch (err) {
+        showLinkError(`JSON 响应体解析失败：${err.message}`);
+        return;
+      }
+    }
+    let headers = null;
+    const headerText = $("#link-headers").value.trim();
+    if (headerText) {
+      try {
+        headers = JSON.parse(headerText);
+      } catch (err) {
+        showLinkError(`响应头 JSON 解析失败：${err.message}`);
+        return;
+      }
+      if (typeof headers !== "object" || Array.isArray(headers) || headers === null) {
+        showLinkError("响应头必须是 JSON 对象（头名称 → 值）。");
+        return;
+      }
+    }
+
+    const rid = state.review.id;
+    const btn = $("#link-run");
+    btn.disabled = true;
+    btn.textContent = "解析中…";
+    $("#link-loading").classList.remove("hidden");
+    $("#link-body-out").innerHTML = "";
+    try {
+      const resp = await fetch(`/api/reviews/${rid}/link-preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          side, method, path, status_code: statusCode,
+          response_body: responseBody, headers,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showLinkError(data.detail || `预览失败（HTTP ${resp.status}）`);
+        return;
+      }
+      renderLinkPreview(data);
+    } catch (err) {
+      showLinkError(`请求失败：${err.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "预览 Link 参数";
+      $("#link-loading").classList.add("hidden");
+    }
+  }
+
+  const MATCH_LABEL = { exact: "精确码", range: "范围码", default: "default 兜底" };
+
+  function linkValueCell(p) {
+    if (!p.provided) return '<span class="imp-none">（未提供）</span>';
+    let src = "";
+    if (p.expression) {
+      src = `<div class="lk-expr" title="运行时表达式"><code>${escapeHtml(p.expression)}</code></div>`;
+    }
+    const cls = p.errors && p.errors.length ? "lk-val-err" : "";
+    // null 是合法常量（算已提供），显式渲染，避免与"未提供"的 — 混淆
+    const text = p.value === null ? "null" : pretty(p.value);
+    return `${src}<pre class="lk-value ${cls}">${escapeHtml(text)}</pre>`;
+  }
+
+  function renderLinkPreview(data) {
+    const m = data.matched_response || {};
+    let html = `
+      <div class="impact-summary">
+        <div class="imp-stat ok"><div class="num">${data.links_count ?? 0}</div><div class="label">匹配响应的 Link 数</div></div>
+        <div class="imp-stat ${data.links_with_errors ? "bad" : "ok"}"><div class="num">${data.links_with_errors ?? 0}</div><div class="label">含错误 / 未知键的 Link</div></div>
+        <div class="imp-stat ${data.links_missing_required ? "bad" : "ok"}"><div class="num">${data.links_missing_required ?? 0}</div><div class="label">缺少必填参数的 Link</div></div>
+      </div>
+      <p class="result-meta">源操作 <b>${escapeHtml((data.source || {}).method || "")} ${escapeHtml((data.source || {}).path || "")}</b>
+      （${data.side === "old" ? "旧版" : "新版"}），状态码 <b>${data.status_code}</b>
+      按<b>${escapeHtml(MATCH_LABEL[m.match] || m.match || "")}</b>匹配到响应
+      <code>${escapeHtml(m.key || "")}</code>（指针 <code>${escapeHtml(m.pointer || "")}</code>）。
+      <b>只预览，不发送请求、不入库、不改变审查结论。</b></p>`;
+
+    const links = data.links || [];
+    if (!links.length) {
+      html += '<div class="empty-hint">匹配到的响应没有声明任何 Link。</div>';
+    } else {
+      html += links.map(renderLinkCard).join("");
+    }
+    $("#link-body-out").innerHTML = html;
+  }
+
+  function renderLinkCard(l) {
+    const hasProblem = (l.errors && l.errors.length) || (l.unknown_keys && l.unknown_keys.length);
+    const t = l.target;
+    const head = `<div class="lk-head ${hasProblem ? "bad" : "ok"}">
+      <span class="lk-name">🔗 ${escapeHtml(l.name)}</span>
+      ${t
+        ? `<span class="finding-endpoint">→ ${escapeHtml(t.method)} ${escapeHtml(t.path || t.pointer || "")}</span>
+           <span class="lk-target-kind">${t.kind === "operationRef" ? "operationRef" : "operationId"}</span>`
+        : '<span class="lk-target-kind bad-target">目标不可用</span>'}
+      ${hasProblem ? `<span class="sc-count bad">${(l.errors || []).length + (l.unknown_keys || []).length} 处问题</span>` : '<span class="sc-count ok">可构造</span>'}
+    </div>`;
+
+    let errorsHtml = "";
+    const allErrors = [
+      ...(l.errors || []).map((e) => e.message),
+      ...(l.unknown_keys || []).flatMap((u) => (u.errors || []).map((e) => `参数键 ${u.key}：${e.message}`)),
+    ];
+    if (allErrors.length) {
+      errorsHtml = `<div class="lk-errors">${allErrors.map((msg) =>
+        `<div class="sc-error">⚠️ ${escapeHtml(msg)}</div>`).join("")}</div>`;
+    }
+
+    let bodyHtml = "";
+    if (l.link_pointer || l.ref) {
+      bodyHtml += `<div class="lk-pointers">
+        ${l.ref ? `<div>Link 引用：<code>${escapeHtml(l.ref)}</code></div>` : ""}
+        <div>Link 指针：<code>${escapeHtml(l.link_pointer || "")}</code></div>
+        ${t ? `<div>目标指针：<code>${escapeHtml(t.pointer || "")}</code></div>` : ""}
+      </div>`;
+    }
+
+    if (l.request_body) {
+      const rb = l.request_body;
+      bodyHtml += `<details class="sc-detail" open>
+        <summary>请求体 requestBody
+          ${rb.expression ? `<code class="lk-expr-inline">${escapeHtml(rb.expression)}</code>` : "（JSON 常量）"}
+          ${rb.errors && rb.errors.length ? `<span class="sc-count bad">${rb.errors.length} 处错误</span>` : ""}
+        </summary>
+        <pre class="lk-value ${rb.errors && rb.errors.length ? "lk-val-err" : ""}">${escapeHtml(rb.value === null ? "null" : pretty(rb.value))}</pre>
+        ${(rb.errors || []).map((e) => `<div class="sc-error">⚠️ ${escapeHtml(e.message)}</div>`).join("")}
+      </details>`;
+    }
+
+    if (t && l.parameters && l.parameters.length) {
+      const rows = l.parameters.map((p) => `
+        <tr class="${p.errors && p.errors.length ? "has-breaking" : ""} ${!p.provided && p.required ? "lk-missing-row" : ""}">
+          <td><code>${escapeHtml(p.in)}</code></td>
+          <td><code>${escapeHtml(p.name)}</code>${p.required ? ' <span class="lk-req">必填</span>' : ""}<div class="lk-level">${p.level === "operation" ? "操作级" : "路径级"}</div></td>
+          <td>${linkValueCell(p)}</td>
+          <td>${(!p.provided && p.required) ? '<span class="lk-missing">缺少必填值</span>' : (p.provided ? '<span class="imp-none">已提供</span>' : '<span class="imp-none">未提供（可选）</span>')}</td>
+        </tr>`).join("");
+      bodyHtml += `<div class="impact-table-wrap"><table class="impact-table lk-table">
+        <thead><tr><th>位置</th><th>参数</th><th>解析值</th><th>状态</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+    }
+
+    if (l.unknown_keys && l.unknown_keys.length) {
+      const rows = l.unknown_keys.map((u) => `
+        <tr class="has-breaking">
+          <td><code>${escapeHtml(u.key)}</code></td>
+          <td>${u.expression ? `<div><code>${escapeHtml(u.expression)}</code></div>` : ""}
+            <pre class="lk-value">${escapeHtml(u.value === null ? "null" : pretty(u.value))}</pre></td>
+          <td>${(u.errors || []).map((e) => `<div class="sc-error">⚠️ ${escapeHtml(e.message)}</div>`).join("")}</td>
+        </tr>`).join("");
+      bodyHtml += `<details class="sc-detail" open>
+        <summary><span class="sc-count bad">${l.unknown_keys.length} 个未被目标参数接受的键</span></summary>
+        <div class="impact-table-wrap"><table class="impact-table lk-table">
+          <thead><tr><th>Link 键</th><th>值 / 表达式</th><th>问题</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table></div>
+      </details>`;
+    }
+
+    return `<div class="lk-card ${hasProblem ? "lk-card-bad" : ""}">${head}${errorsHtml}${bodyHtml}</div>`;
   }
 
   // ------------------------------------------------------------------ //

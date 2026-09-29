@@ -1,6 +1,6 @@
 # 🔎 OpenAPI 版本兼容性审查工具
 
-对比新旧两份 **OpenAPI 3.x**（JSON / YAML）文档，递归解析 `$ref`（**支持循环引用**）、合并 `allOf`，按**请求 / 响应两个方向**的语义规则判断每一处变更是否向后兼容，精确定位破坏性变更的 JSON 路径并给出原因；并按 OpenAPI 语义计算每个操作的**有效认证要求**（操作级 `security` 覆盖根级），识别认证收紧（缺少方案 / OAuth scope 变多 / 匿名变需认证）类破坏。支持结果筛选、**根因聚合视图**（有向影响组）、引用展开树浏览、审查报告下载、**单条发现的最小复现包导出**、历史记录与**破坏项对账**（基线审查 vs 当前审查）、**限时豁免**（按 API 标识为破坏项设置带 UTC 到期时间的豁免，"未豁免为零才可放行"）、**组件可达性审计**（从 paths / webhooks 入口沿本地 `$ref` 传递追踪，列出未被入口触达的组件并标出新版独有的未使用组件）、**调用清单影响定位**（在审查详情导入 `method,path,count` 的 CSV，按旧版 paths 匹配每行调用、按操作汇总调用量并关联破坏性发现；歧义不分配、结果仅本次查看），以及**请求样本回放**（提交多条含旧版操作方法 / 路径模板 / Content-Type / JSON 请求体的样本，逐条返回旧版与新版请求体校验状态、失败字段路径与"旧版接受而新版拒绝"的风险汇总；结果仅本次查看）。
+对比新旧两份 **OpenAPI 3.x**（JSON / YAML）文档，递归解析 `$ref`（**支持循环引用**）、合并 `allOf`，按**请求 / 响应两个方向**的语义规则判断每一处变更是否向后兼容，精确定位破坏性变更的 JSON 路径并给出原因；并按 OpenAPI 语义计算每个操作的**有效认证要求**（操作级 `security` 覆盖根级），识别认证收紧（缺少方案 / OAuth scope 变多 / 匿名变需认证）类破坏。支持结果筛选、**根因聚合视图**（有向影响组）、引用展开树浏览、审查报告下载、**单条发现的最小复现包导出**、历史记录与**破坏项对账**（基线审查 vs 当前审查）、**限时豁免**（按 API 标识为破坏项设置带 UTC 到期时间的豁免，"未豁免为零才可放行"）、**组件可达性审计**（从 paths / webhooks 入口沿本地 `$ref` 传递追踪，列出未被入口触达的组件并标出新版独有的未使用组件）、**调用清单影响定位**（在审查详情导入 `method,path,count` 的 CSV，按旧版 paths 匹配每行调用、按操作汇总调用量并关联破坏性发现；歧义不分配、结果仅本次查看），以及**请求样本回放**（提交多条含旧版操作方法 / 路径模板 / Content-Type / JSON 请求体的样本，逐条返回旧版与新版请求体校验状态、失败字段路径与"旧版接受而新版拒绝"的风险汇总；结果仅本次查看），以及 **Link 后续调用参数预览**（在审查详情选择旧 / 新版与源操作，提交一次响应实例：状态码 + JSON 响应体 + 响应头；响应按精确码 → 范围码 → default 匹配，逐条 Link 显示指针、目标方法 / 路径与每个后续调用参数的解析值与缺失 / 未知 / 表达式错误；仅静态预览，不发请求、不入库、不改结论）。
 
 技术栈：**FastAPI + SQLite + 原生 JavaScript**（前端零构建、零框架依赖）。
 
@@ -58,6 +58,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    - **组件可达性审计**：旧版 / 新版两栏列出未被 paths / webhooks 入口触达的组件（类型 / 名称 / 数量），新版独有的未使用组件带徽标，点击条目定位到对应版本的引用树（详见下文「🧭 组件可达性审计」）；
    - **调用清单影响定位**：导入 `method,path,count` 的 CSV，把真实/预期调用量匹配到旧版操作并关联该操作的破坏性发现（详见下文「📊 调用清单影响定位」）；
    - **请求样本回放**：提交多条请求样本（旧版操作方法 + 路径模板 + Content-Type + JSON 请求体），逐条查看旧版 / 新版请求体校验状态与失败字段路径，汇总"旧版接受而新版拒绝"风险（详见下文「🧪 请求样本回放」）；
+   - **Link 后续调用参数预览**：选择旧 / 新版与源操作，提交状态码、JSON 响应体与响应头，逐条预览响应中 OpenAPI Link 指向的下一跳调用参数（方法 / 路径 / 每个参数的取值、请求体、缺失必填与表达式错误；详见下文「🔗 Link 后续调用参数预览」）；
    - **逐条发现 / 根因聚合** 视图切换：聚合视图把同根因的发现折叠为有向影响组（详见下文「🧩 根因聚合视图」）；
    - **级别筛选**：🔴 破坏性 / 🟢 兼容 / 🟡 废弃提示 / ⚪ 信息；
    - **方向筛选**（请求 / 响应 / 结构性）、**分类筛选**、关键字搜索（两种视图均生效）；
@@ -368,6 +369,137 @@ curl -X POST http://localhost:8000/api/reviews/1/sample-check \
 
 ---
 
+## 🔗 Link 后续调用参数预览
+
+OpenAPI 的 **Link 对象**描述"收到这个响应之后，客户端接下来可以怎么调"——但 Link 的参数值是**运行时表达式**（如 `$response.body#/id`），契约里看不到真正会传什么。「🔗 Link 后续调用参数预览」面板用一次**响应实例**（状态码 + JSON 响应体 + 响应头）把这些表达式当场求值，逐条展示每个 Link 的目标操作与构造出的后续调用参数。**整个过程只做静态预览：不发送任何请求、不入库、不出现在报告中、不改变审查结论。**
+
+### 提交内容
+
+在审查详情的面板中选择 / 填写：
+
+| 字段 | 说明 |
+| --- | --- |
+| 版本 | **旧版**或**新版**文档（Link 在响应里，因此预览始终在同一侧文档内完成源 → 目标解析） |
+| 方法 / 路径模板 | **源操作**：HTTP 方法（大小写不敏感）+ 路径模板（如 `POST /pets`，精确匹配） |
+| 状态码 | 响应实例的状态码（100–599 整数；YAML 里写成整数的响应键也按字符串匹配） |
+| JSON 响应体 | 任意 JSON 值（也接受 JSON 文本字符串），供 `$response.body#…` 取值 |
+| 响应头 | JSON 对象（头名称 → 值），供 `$response.header.…` 取值 |
+
+### 响应匹配顺序
+
+对源操作的 `responses` 依次尝试：**精确码（`201`）→ 范围码（`1XX`…`5XX`，如 `4XX`）→ `default`**，三者命中第一个即停止（`4XX` 不会去匹配 5xx 状态码）；都没有则返回 HTTP 400 并列出已声明的响应键。结果中返回命中的键、匹配方式（`exact` / `range` / `default`）与响应对象的 JSON Pointer（含解引用后的指针与声明位置指针）。
+
+### Link 与目标解析
+
+- 逐条遍历匹配响应的 `links`（保持文档顺序）。Link 可以内联，也可以是指向 `components/links` 的**本地 `$ref`**；
+- 响应、Link、参数上的**本地 `$ref` 链都做循环检测**：A→B→A 安全终止并对该条报 `circular-ref`，不会无限递归；**外部引用**（`http://…`、`./other.yaml#…`、裸 `foo.json` 等）一律报 `external-ref` 不做解析；指针无法解析报 `unresolved-ref`；
+- 目标二选一（同时给出报 `operation-both-id-and-ref`，都没有报 `link-no-target`）：
+  - **`operationId`**：在 `paths` 与 `webhooks` 的全部操作中索引；**必须唯一**——找不到报 `operation-id-not-found`，命中多个报 `operation-id-ambiguous`（列出全部候选）；
+  - **`operationRef`**：只接受本文档内 `#/…` JSON Pointer（外部引用报错），且落点必须是操作对象（末段为 HTTP 方法且含 `responses`），否则报 `operation-ref-not-operation` / `operation-ref-unresolved`；支持指向 `paths` 或 `webhooks` 下的操作。
+
+### 参数值与合并规则
+
+- 目标参数 = **路径级 `parameters` 与操作级 `parameters` 按 `(in, name)` 合并，操作级覆盖路径级**（输出中以 `level: path | operation` 标明来源）；`path` 参数恒为必填；参数本身的本地 `$ref` 同样循环安全、外部引用报错；
+- Link `parameters` 的**键**：
+  - `位置.名称` 形式（如 `path.petId`、`header.X-Trace`）直接定位；位置非 `path/query/header/cookie` 报 `unknown-parameter`；
+  - **裸名**（如 `petId`）按名称在目标参数中匹配：**裸名必须唯一**，同名列于多个位置时报 `ambiguous-parameter`（提示改用 `位置.名称`），目标没有该参数报 `unknown-parameter`；
+- **值**支持三类：
+  1. **JSON 常量**（数字 / 字符串 / 布尔 / 对象 / 数组，以及 **`null`——null 是合法常量、算"已提供"**，不会被当成缺失）；
+  2. **`$response.body#/JSONPointer`**：在提交的响应体上按 JSON Pointer 取值（支持数组下标；token 按 RFC 6901 解码 **`~1`→`/`、`~0`→`~`**）；指针取不到（键不存在 / 下标越界等）报 `expression-not-resolved`；
+  3. **`$response.header.名称`**：在提交的响应头中查找，**头名称忽略大小写**（`$response.header.x-request-id` 可命中 `X-Request-Id`）；响应实例没有该头报 `header-not-found`，按字符串原值给出；
+  - 其余运行时表达式（`$request.*`、`$method`、`$statusCode`、`$response.body`（不带 `#`）、`$foo` 等）一律报 **`unsupported-expression`**；
+  - 字符串以 `$` 开头才按表达式解析，其余都按 JSON 常量；
+- Link 的 **`requestBody`** 不是参数，但同样按上述三类值解析并单独预览（含其表达式错误）；
+- 输出会列出目标操作的**全部参数**：未赋值的标 `provided: false`；其中**必填且未提供**的汇总进该 Link 的 `missing_required` 并在页面高亮（表达式取值失败也算未提供，同时保留表达式错误）。
+
+### 逐条输出
+
+每条 Link 给出：Link 名称与 JSON Pointer（`$ref` 组件时给出引用值与解引用后的实际指针）、目标（方法、路径模板、operationId/operationRef、目标指针）、参数表（位置 / 名称 / 必填 / 路径级或操作级 / 解析值与来源表达式 / 状态）、请求体、未被目标接受的键（`unknown_keys`）、缺少的必填参数，以及该条的全部 `errors`（`{code, message}`）。顶部汇总 Link 总数、含错误 / 未知键的条数、缺少必填参数的条数。源路径 / 源操作不存在、无匹配响应、侧别或状态码非法等**请求级问题返回 HTTP 400 / 404**；**Link 级问题不阻断其他 Link，逐条在结果中报错。**
+
+### HTTP API 调用示例
+
+`POST /api/reviews/{id}/link-preview`，请求体为 JSON：
+
+```bash
+curl -X POST http://localhost:8000/api/reviews/1/link-preview \
+  -H "Content-Type: application/json" \
+  -d '{
+    "side": "old",
+    "method": "POST",
+    "path": "/pets",
+    "status_code": 201,
+    "response_body": { "data": { "id": 42, "/slug": "rex" } },
+    "headers": { "X-Request-Id": "abc-123" }
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "review_id": 1,
+  "side": "old",
+  "source": { "method": "POST", "path": "/pets" },
+  "status_code": 201,
+  "matched_response": {
+    "key": "201", "match": "exact",
+    "pointer": "/paths/~1pets/post/responses/201",
+    "declared_pointer": "/paths/~1pets/post/responses/201"
+  },
+  "links_count": 1,
+  "links_with_errors": 1,
+  "links_missing_required": 1,
+  "links": [
+    {
+      "name": "getPet",
+      "link_pointer": "/paths/~1pets/post/responses/201/links/getPet",
+      "ref": null,
+      "target": {
+        "kind": "operationId", "operation_id": "getPet", "operation_ref": null,
+        "method": "GET", "path": "/pets/{petId}",
+        "pointer": "/paths/~1pets~1{petId}/get"
+      },
+      "parameters": [
+        { "name": "petId", "in": "path", "required": true, "level": "path",
+          "provided": true, "value": 42,
+          "expression": "$response.body#/data/id", "errors": [] }
+      ],
+      "unknown_keys": [
+        { "key": "bad", "value": null, "expression": "$request.body#/x",
+          "errors": [ { "code": "unsupported-expression", "message": "…" } ] }
+      ],
+      "missing_required": [ { "name": "X-Tenant", "in": "header" } ],
+      "request_body": {
+        "provided": true,
+        "value": { "createdFrom": 42 },
+        "expression": null,
+        "errors": []
+      },
+      "errors": [ { "code": "unsupported-expression", "message": "…" } ]
+    }
+  ],
+  "note": "仅基于提交的响应实例做静态预览：不发送请求、不入库、不改变审查结论。"
+}
+```
+
+错误码（`errors[].code` / `unknown_keys[].errors[].code`）一览：
+
+| code | 触发条件 |
+| --- | --- |
+| `external-ref` / `link-external-ref` / `parameter-external-ref` / `operation-ref-external` | 响应 / Link / 参数 / operationRef 用了外部文档引用 |
+| `circular-ref` / `link-circular-ref` / `parameter-circular-ref` | 本地 `$ref` 链存在循环 |
+| `unresolved-ref` / `link-unresolved-ref` / `parameter-invalid` | `$ref` 指针无法解析、参数对象缺 `name` / `in` |
+| `link-no-target` / `operation-both-id-and-ref` | Link 无目标、同时给出 operationId 与 operationRef |
+| `operation-id-not-found` / `operation-id-ambiguous` | operationId 缺失或不唯一 |
+| `operation-ref-not-operation` / `operation-ref-unresolved` / `operation-ref-invalid` | operationRef 落点不是操作 / 无法解析 |
+| `unknown-parameter` / `ambiguous-parameter` | 键指向目标不存在的参数；裸名在目标中不唯一 |
+| `unsupported-expression` / `expression-not-resolved` / `header-not-found` | 不支持的运行时表达式；body 指针取不到；响应头缺失 |
+| `link-invalid` / `link-parameters-invalid` | Link 不是对象；`parameters` 不是映射 |
+
+请求级错误（HTTP 400，`detail` 为中文说明）：侧别非法、方法非法、路径不以 `/` 开头、状态码越界、源路径 / 源操作不存在、无任何可匹配该状态码的响应、响应或其 `$ref` 链为外部 / 循环 / 失效引用、响应体 JSON 文本解析失败等；审查不存在返回 404。
+
+---
+
 ## 🛡️ 限时豁免
 
 某些破坏性变更短期内无法修复，但又不能一直阻塞发布——**限时豁免**允许为具体破坏项登记一条带 **UTC 到期时间**的豁免，到期或手动撤销后自动失效，避免"永久豁免"被遗忘。
@@ -446,7 +578,7 @@ curl -X POST http://localhost:8000/api/reviews/1/sample-check \
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI：审查 / 历史 / 引用树 / 根因聚合 / 破坏项对账 / 组件可达性审计 / 调用清单影响定位 / 请求样本回放 / 限时豁免 / 报告下载 / 健康检查接口
+│   ├── main.py        # FastAPI：审查 / 历史 / 引用树 / 根因聚合 / 破坏项对账 / 组件可达性审计 / 调用清单影响定位 / 请求样本回放 / Link 参数预览 / 限时豁免 / 报告下载 / 健康检查接口
 │   ├── parser.py      # JSON·YAML 载入与 OpenAPI 3.x 校验
 │   ├── refs.py        # JSON Pointer、$ref 解析、循环安全的引用展开树
 │   ├── diff.py        # 语义兼容性规则引擎（请求/响应双方向 + 操作级/根级 security 认证要求）
@@ -455,6 +587,7 @@ curl -X POST http://localhost:8000/api/reviews/1/sample-check \
 │   ├── reachability.py # 组件可达性审计：paths/webhooks 入口 → 本地 $ref 传递追踪，未触达组件与无效引用
 │   ├── impact.py      # 调用清单影响定位：CSV(method,path,count) → 旧版操作匹配（静态段优先/歧义不分配）+ 破坏关联
 │   ├── samplecheck.py # 请求样本回放：双侧请求体 schema 校验（type/required/enum/properties/items/allOf/本地$ref，循环安全）+ 旧接受/新拒绝风险汇总
+│   ├── linkpreview.py # Link 后续调用参数预览：响应实例求值 $response.body#/#header（精确/范围/default 响应匹配、operationId/本地 operationRef 目标、路径级+操作级参数合并，$ref 循环安全、外部引用报错）
 │   ├── exemptions.py  # 限时豁免：API 标识 + 语义指纹匹配，到期 / 撤销判定与放行结论
 │   ├── repro.py       # 最小复现包：文档裁剪、$ref 闭包、复核与 ZIP 打包
 │   ├── reports.py     # Markdown / JSON 报告生成
@@ -462,7 +595,7 @@ curl -X POST http://localhost:8000/api/reviews/1/sample-check \
 ├── static/
 │   ├── index.html     # 单页界面
 │   ├── styles.css
-│   ├── app.js         # 原生 JS：筛选 / 聚合视图 / 展开树 / 历史 / 对账 / 调用清单导入 / 请求样本回放 / 下载
+│   ├── app.js         # 原生 JS：筛选 / 聚合视图 / 展开树 / 历史 / 对账 / 调用清单导入 / 请求样本回放 / Link 参数预览 / 下载
 │   └── samples.js     # 五组内置示例（JSON + YAML，含认证要求收紧）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -485,6 +618,7 @@ curl -X POST http://localhost:8000/api/reviews/1/sample-check \
 | `GET` | `/api/reviews/{id}/reachability` | 组件可达性审计：各侧未触达组件（类型/名称/数量）、新版独有标记、无效本地引用明细 |
 | `POST` | `/api/reviews/{id}/impact` | 调用清单影响定位：请求体为 `method,path,count` 的 CSV 文本（`Content-Type: text/csv`），返回按调用量排序的影响表及未匹配 / 歧义 / 非法行（实时计算、不入库、不改变审查结论；缺列 / 无数据行返回 400） |
 | `POST` | `/api/reviews/{id}/sample-check` | 请求样本回放：请求体 `{samples: [{method, path, content_type, body}, ...]}`，逐条返回旧版 / 新版请求体校验状态（accepted/rejected/undeterminable）、失败字段路径与「旧版接受而新版拒绝」风险汇总（实时计算、不入库、不改变审查结论；samples 缺失 / 为空 / 非数组 / 超 200 条返回 400，单条格式错误在条目中逐条报错） |
+| `POST` | `/api/reviews/{id}/link-preview` | Link 后续调用参数预览：请求体 `{side: old\|new, method, path, status_code, response_body, headers}`，响应按精确码 → 范围码 → default 匹配，逐条返回 Link 指针、唯一 operationId / 本地 operationRef 目标方法路径与每个参数的解析值（JSON 常量 / `$response.body#JSONPointer` / `$response.header.名称`，~0/~1 解码、头名忽略大小写、null 算已提供；路径级+操作级参数合并）及未知参数 / 歧义裸名 / 缺必填 / 不支持表达式 / 外部或失效 $ref 逐条错误（实时计算、不发请求、不入库、不改变审查结论；源操作或响应缺失等请求级问题 400，审查不存在 404） |
 | `GET` | `/api/reviews/{id}/pointers` | 引用树根节点分组（paths / components） |
 | `GET` | `/api/reviews/{id}/tree?side=old|new&pointer=/...` | 引用展开树（含循环标记） |
 | `GET` | `/api/reviews/{id}/report?format=markdown|json` | 下载报告（含豁免匹配状态、理由与到期时间） |

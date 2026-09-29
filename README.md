@@ -368,6 +368,110 @@ curl -X POST http://localhost:8000/api/reviews/1/sample-check \
 
 ---
 
+## 🔗 Link 后续调用参数预览
+
+OpenAPI 的 Link 描述"本次响应"与"下一步调用"之间的参数传递关系。在审查详情页通过 **HTTP API** 提交一次响应实例（源方法 + 路径模板 + 状态码 + JSON 响应体 + 响应头），后端在选定侧（旧版 / 新版）文档中定位响应并**逐条预览每个 Link 解析出的目标操作与参数值**——不发送任何请求，只做静态解析。
+
+### 提交内容（`POST /api/reviews/{id}/link-preview`）
+
+| 字段 | 说明 |
+| --- | --- |
+| `side` | `old`（默认）或 `new`：在哪个版本的文档上预览 |
+| `method` | 源操作的 HTTP 方法，大小写不敏感（如 `POST`） |
+| `path` | 源操作的**路径模板**（如 `/pets`，精确匹配） |
+| `statusCode` | 提交的响应状态码（100–599）；响应依次按**精确码 → 范围码（`1XX/2XX/…`）→ `default`** 匹配 |
+| `body` | JSON 响应体：可直接写 JSON 值，也可给 JSON 文本字符串；可缺省（视为 null） |
+| `headers` | 响应头对象（名称 → 值）；**头名忽略大小写** |
+
+### 解析与报错规则
+
+（服务端 `app/links_preview.py`，纯函数、实时计算、不入库）
+
+- **Link 目标**：`operationId` 必须在文档中**唯一**（不唯一逐条报错）；`operationRef` 必须是**本地**引用且指向 `#/paths/路径模板/方法` 形式的具体操作——**外部引用（文件 / URL）报错**；两者同时出现或都不出现也逐条报错。
+- **本地 `$ref` 链循环安全**：响应、Link、参数上的本地 `$ref` 沿链解析，链上回到已访问指针即报**循环引用**（不无限递归）；**外部 `$ref` 一律报错**；兼容 OpenAPI 3.1 中 `$ref` 与兄弟字段并存（兄弟字段覆盖引用目标的同名字段）。响应自身的引用问题为请求级错误（HTTP 400），单个 Link / 参数的引用问题只在该条 `errors` 中报错。
+- **取值表达式**：
+  - JSON **常量**（字符串 / 数字 / 布尔 / 对象 / 数组 / **`null`**——**null 视为已提供，不算缺失**）；
+  - `$response.body#/JSONPointer`：从响应体取值，Pointer 段按 RFC 6901 **解码 `~0` → `~`、`~1` → `/`**；`$response.body#`（空指针）表示整个响应体；指针取不到值逐条报错；
+  - `$response.header.名称`：从响应头取值，**头名忽略大小写**（如响应里是 `X-Trace-Id`，写 `$response.header.x-trace-id` 也可命中）；缺失逐条报错；
+  - **其余运行时表达式**（`$request.*`、`$statusCode`、裸 `$response.body` 等）逐条报"**不支持的运行时表达式**"。
+- **目标参数合并**：目标操作的参数 = **路径级 `parameters` + 操作级 `parameters`**，按 `(位置, 名称)` 合并，**操作级覆盖路径级**（path 参数按 OpenAPI 规则恒为必填）。
+- **Link 键**：可写完整的 `位置.名称`（如 `query.id`、`path.id`）；只写**裸名称**时必须在目标参数中**唯一**——同名出现在多个位置逐条报**歧义**（提示改用 `位置.名称`）；位置非法（如 `body.id`）或目标中不存在该参数逐条报错。
+- **必填检查**：所有取值解析完成后，仍**缺少必填值**的目标参数逐条报错（显式给 null 不算缺失）。
+- **源操作 / 响应缺失**：选定侧找不到源操作、操作无 `responses`、或精确码 / 范围码 / default 都无法匹配时，返回 HTTP 400 并列出已声明的响应键；审查不存在返回 404。
+- **只预览**：**不发送请求、不入库、不出现在报告中、不改变审查结论**。
+
+### 返回结果
+
+- `source`：源方法 / 模板 / 指针、提交状态码、实际命中的响应键与匹配方式（`exact` / `range` / `default`）、响应对象指针；
+- `links[]`：每个 Link 的**指针**（在源响应中的位置；经 `$ref` 引用时附 `ref` 字段）、**目标方法 / 路径 / 指针**、全部目标参数清单（名称、位置、是否必填、是否已提供、解析出的值、值来源 `constant` / `response.body` / `response.header`、原始表达式）、所有 path 参数齐备时的预览路径 `resolved_path`，以及该条的 `errors`；Link 声明了 `requestBody` 时同样按上述表达式规则解析并单独给出；
+- `summary`：Link 总数、成功数、逐条错误数。
+
+### HTTP API 调用示例
+
+```bash
+curl -X POST http://localhost:8000/api/reviews/1/link-preview \
+  -H "Content-Type: application/json" \
+  -d '{
+    "side": "old",
+    "method": "POST",
+    "path": "/pets",
+    "statusCode": 201,
+    "body": { "data": { "id": "pet-42" } },
+    "headers": { "X-Trace-Id": "abc123" }
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "review_id": 1,
+  "side": "old",
+  "source": {
+    "method": "POST",
+    "path": "/pets",
+    "pointer": "/paths/~1pets/post",
+    "status_code": 201,
+    "response_key": "201",
+    "match_type": "exact",
+    "response_pointer": "/paths/~1pets/post/responses/201"
+  },
+  "summary": { "links": 2, "ok": 1, "errors": 1 },
+  "links": [
+    {
+      "index": 1,
+      "name": "GetPet",
+      "link_pointer": "/paths/~1pets/post/responses/201/links/GetPet",
+      "ref": null,
+      "target": {
+        "method": "GET",
+        "path": "/pets/{id}",
+        "pointer": "/paths/~1pets~1{id}/get"
+      },
+      "parameters": [
+        {
+          "name": "id", "in": "path", "required": true, "provided": true,
+          "value": "pet-42", "value_source": "response.body",
+          "expression": "$response.body#/data/id"
+        },
+        {
+          "name": "trace", "in": "header", "required": false, "provided": true,
+          "value": "abc123", "value_source": "response.header",
+          "expression": "$response.header.X-Trace-Id"
+        }
+      ],
+      "resolved_path": "/pets/pet-42",
+      "errors": []
+    }
+  ],
+  "note": "仅为 Link 后续调用参数预览：不发送请求、不入库、不改变审查结论。"
+}
+```
+
+源操作 / 响应缺失返回 HTTP 400（如 `"源操作 DELETE /pets 不存在。"`、`"…没有可匹配状态码 404 的响应（依次尝试精确码 404、范围码 4XX、default）；已声明：200、default。"`）；Link 级问题（目标不唯一 / 歧义 / 未知参数 / 缺少必填值 / 外部或循环引用 / 不支持的表达式）出现在对应 Link 的 `errors` 数组中，不影响其他 Link 的预览。
+
+---
+
 ## 🛡️ 限时豁免
 
 某些破坏性变更短期内无法修复，但又不能一直阻塞发布——**限时豁免**允许为具体破坏项登记一条带 **UTC 到期时间**的豁免，到期或手动撤销后自动失效，避免"永久豁免"被遗忘。
@@ -455,6 +559,7 @@ curl -X POST http://localhost:8000/api/reviews/1/sample-check \
 │   ├── reachability.py # 组件可达性审计：paths/webhooks 入口 → 本地 $ref 传递追踪，未触达组件与无效引用
 │   ├── impact.py      # 调用清单影响定位：CSV(method,path,count) → 旧版操作匹配（静态段优先/歧义不分配）+ 破坏关联
 │   ├── samplecheck.py # 请求样本回放：双侧请求体 schema 校验（type/required/enum/properties/items/allOf/本地$ref，循环安全）+ 旧接受/新拒绝风险汇总
+│   ├── links_preview.py # Link 后续调用参数预览：响应精确/范围/default 匹配，operationId/本地 operationRef 定位，$response.body#/header 表达式取值，路径级+操作级参数合并，$ref 循环安全、逐条报错（只预览、不发请求）
 │   ├── exemptions.py  # 限时豁免：API 标识 + 语义指纹匹配，到期 / 撤销判定与放行结论
 │   ├── repro.py       # 最小复现包：文档裁剪、$ref 闭包、复核与 ZIP 打包
 │   ├── reports.py     # Markdown / JSON 报告生成
@@ -485,6 +590,7 @@ curl -X POST http://localhost:8000/api/reviews/1/sample-check \
 | `GET` | `/api/reviews/{id}/reachability` | 组件可达性审计：各侧未触达组件（类型/名称/数量）、新版独有标记、无效本地引用明细 |
 | `POST` | `/api/reviews/{id}/impact` | 调用清单影响定位：请求体为 `method,path,count` 的 CSV 文本（`Content-Type: text/csv`），返回按调用量排序的影响表及未匹配 / 歧义 / 非法行（实时计算、不入库、不改变审查结论；缺列 / 无数据行返回 400） |
 | `POST` | `/api/reviews/{id}/sample-check` | 请求样本回放：请求体 `{samples: [{method, path, content_type, body}, ...]}`，逐条返回旧版 / 新版请求体校验状态（accepted/rejected/undeterminable）、失败字段路径与「旧版接受而新版拒绝」风险汇总（实时计算、不入库、不改变审查结论；samples 缺失 / 为空 / 非数组 / 超 200 条返回 400，单条格式错误在条目中逐条报错） |
+| `POST` | `/api/reviews/{id}/link-preview` | Link 后续调用参数预览：请求体 `{side?, method, path, statusCode, body?, headers?}`，按精确码 → 范围码 → default 匹配响应，逐条给出 Link 指针、唯一 operationId / 本地 operationRef 目标与各参数值（JSON 常量、`$response.body#/JSONPointer`、`$response.header.名称`）；路径级与操作级参数合并（操作级覆盖），歧义 / 未知参数 / 缺少必填值 / 外部或循环 `$ref` / 不支持的表达式逐条报错；源操作或响应缺失返回 400（只预览、不发请求、不入库、不改变审查结论） |
 | `GET` | `/api/reviews/{id}/pointers` | 引用树根节点分组（paths / components） |
 | `GET` | `/api/reviews/{id}/tree?side=old|new&pointer=/...` | 引用展开树（含循环标记） |
 | `GET` | `/api/reviews/{id}/report?format=markdown|json` | 下载报告（含豁免匹配状态、理由与到期时间） |
